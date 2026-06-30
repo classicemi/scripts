@@ -41,3 +41,37 @@ At the prompt:
 
 - Node.js 18+ (uses the built-in `fetch`; zero dependencies)
 - `git`
+
+## gid — set this repo's git identity
+
+Sets the **current** git repository's local `user.name` and `user.email` to the
+values configured in `.env`. Useful for switching identities per repo (e.g. work
+vs. personal) without touching your global config.
+
+### Setup
+
+```sh
+cp .env.example .env
+# edit .env and set GIT_USER_NAME and GIT_USER_EMAIL
+```
+
+| Variable         | Required | Notes                        |
+| ---------------- | -------- | ---------------------------- |
+| `GIT_USER_NAME`  | one of   | sets local `user.name`       |
+| `GIT_USER_EMAIL` | the two  | sets local `user.email`      |
+
+At least one of the two must be set; each is applied only if present.
+
+### Usage
+
+```sh
+cd some/repo
+gid                 # sets local user.name / user.email, prints old → new
+```
+
+Runs `git config --local` (per-repo only, never `--global`).
+
+### Requirements
+
+- Node.js (zero dependencies)
+- `git`
