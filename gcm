@@ -1,0 +1,249 @@
+#!/usr/bin/env node
+'use strict';
+
+/**
+ * gcm — generate a Conventional-Commits message from staged changes using
+ * the DeepSeek API, preview it, and commit on confirmation.
+ *
+ * Config: a `.env` file living next to this script with at least:
+ *   DEEPSEEK_API_KEY=sk-...
+ *   DEEPSEEK_MODEL=deepseek-v4-flash   # optional, this is the default
+ */
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const readline = require('readline');
+const { execFileSync, spawnSync } = require('child_process');
+
+const SCRIPT_DIR = path.dirname(fs.realpathSync(process.argv[1]));
+const API_URL = 'https://api.deepseek.com/chat/completions';
+const DEFAULT_MODEL = 'deepseek-v4-flash';
+const DIFF_CHAR_CAP = 16000;
+
+// --- tiny ANSI helpers (auto-disabled when not a TTY) ---
+const useColor = process.stdout.isTTY;
+const c = (code, s) => (useColor ? `\x1b[${code}m${s}\x1b[0m` : s);
+const bold = (s) => c('1', s);
+const dim = (s) => c('2', s);
+const red = (s) => c('31', s);
+const green = (s) => c('32', s);
+const yellow = (s) => c('33', s);
+const cyan = (s) => c('36', s);
+
+function die(msg) {
+  console.error(`${red('✗')} ${msg}`);
+  process.exit(1);
+}
+
+function git(args, opts = {}) {
+  return execFileSync('git', args, { encoding: 'utf8', ...opts });
+}
+
+function loadEnv() {
+  const file = path.join(SCRIPT_DIR, '.env');
+  const env = {};
+  if (fs.existsSync(file)) {
+    for (const raw of fs.readFileSync(file, 'utf8').split('\n')) {
+      const line = raw.trim();
+      if (!line || line.startsWith('#')) continue;
+      const eq = line.indexOf('=');
+      if (eq === -1) continue;
+      const key = line.slice(0, eq).trim();
+      let val = line.slice(eq + 1).trim();
+      if (
+        (val.startsWith('"') && val.endsWith('"')) ||
+        (val.startsWith("'") && val.endsWith("'"))
+      ) {
+        val = val.slice(1, -1);
+      }
+      env[key] = val;
+    }
+  }
+  // real environment variables take precedence over the .env file
+  return { ...env, ...process.env };
+}
+
+function ensureGitRepo() {
+  try {
+    git(['rev-parse', '--is-inside-work-tree'], { stdio: ['ignore', 'pipe', 'ignore'] });
+  } catch {
+    die('Not inside a git repository.');
+  }
+}
+
+function getStaged() {
+  const nameStatus = git(['diff', '--cached', '--name-status']).trim();
+  if (!nameStatus) {
+    die('No staged changes. Stage files with `git add` first.');
+  }
+  let diff = git(['diff', '--cached']);
+  let truncated = false;
+  if (diff.length > DIFF_CHAR_CAP) {
+    diff = diff.slice(0, DIFF_CHAR_CAP);
+    truncated = true;
+  }
+  return { nameStatus, diff, truncated };
+}
+
+const SYSTEM_PROMPT = `You are a senior engineer writing a git commit message.
+Follow the Conventional Commits specification strictly.
+
+Rules:
+- Format: <type>(<optional scope>): <subject>
+- type is one of: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert
+- Subject: imperative mood, lowercase first letter, no trailing period, <= 72 chars.
+- Write everything in ENGLISH.
+- If the change is non-trivial, add a blank line then a body of 1-4 short bullet
+  lines (each starting with "- ") explaining what and why.
+- Output ONLY the raw commit message. No markdown fences, no preamble, no quotes.`;
+
+async function generateMessage(env, staged) {
+  const apiKey = env.DEEPSEEK_API_KEY;
+  if (!apiKey) {
+    die(
+      `DEEPSEEK_API_KEY is not set.\n` +
+        `  Create ${cyan(path.join(SCRIPT_DIR, '.env'))} from .env.example and add your key.`
+    );
+  }
+  const model = env.DEEPSEEK_MODEL || DEFAULT_MODEL;
+
+  const userContent =
+    `Staged files:\n${staged.nameStatus}\n\n` +
+    `Staged diff${staged.truncated ? ' (truncated)' : ''}:\n${staged.diff}`;
+
+  let res;
+  try {
+    res = await fetch(API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        temperature: 0.2,
+        messages: [
+          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'user', content: userContent },
+        ],
+      }),
+    });
+  } catch (e) {
+    die(`Request to DeepSeek failed: ${e.message}`);
+  }
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    die(`DeepSeek API error ${res.status}: ${text.slice(0, 500)}`);
+  }
+
+  const data = await res.json();
+  let msg = data?.choices?.[0]?.message?.content;
+  if (!msg || !msg.trim()) {
+    die('DeepSeek returned an empty message.');
+  }
+  return cleanMessage(msg);
+}
+
+function cleanMessage(msg) {
+  let m = msg.trim();
+  // strip a wrapping ```...``` fence if the model added one
+  if (m.startsWith('```')) {
+    m = m.replace(/^```[a-zA-Z]*\n?/, '').replace(/\n?```$/, '').trim();
+  }
+  return m;
+}
+
+function previewBox(message) {
+  const lines = message.split('\n');
+  const width = Math.min(
+    Math.max(60, ...lines.map((l) => l.length)),
+    process.stdout.columns ? process.stdout.columns - 2 : 80
+  );
+  const top = '┌' + '─'.repeat(width) + '┐';
+  const bottom = '└' + '─'.repeat(width) + '┘';
+  console.log('\n' + cyan(bold('Generated commit message:')));
+  console.log(dim(top));
+  for (const l of lines) {
+    const padded = l.length > width ? l.slice(0, width) : l + ' '.repeat(width - l.length);
+    console.log(dim('│') + padded + dim('│'));
+  }
+  console.log(dim(bottom));
+}
+
+function ask(question) {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
+}
+
+function editMessage(message) {
+  const editor = process.env.EDITOR || process.env.VISUAL || 'vi';
+  const tmp = path.join(os.tmpdir(), `gcm-${process.pid}.txt`);
+  fs.writeFileSync(tmp, message + '\n');
+  const [cmd, ...rest] = editor.split(' ');
+  const r = spawnSync(cmd, [...rest, tmp], { stdio: 'inherit' });
+  if (r.status !== 0 && r.error) {
+    console.error(red(`Editor failed: ${r.error.message}`));
+  }
+  const edited = fs.readFileSync(tmp, 'utf8');
+  fs.unlinkSync(tmp);
+  // drop trailing comment-only / empty lines, keep meaningful content
+  return edited.replace(/\s+$/, '');
+}
+
+function commit(message) {
+  try {
+    git(['commit', '-F', '-'], { input: message, stdio: ['pipe', 'inherit', 'inherit'] });
+    console.log(green('✓ Committed.'));
+  } catch {
+    die('git commit failed.');
+  }
+}
+
+async function main() {
+  ensureGitRepo();
+  const env = loadEnv();
+  const staged = getStaged();
+
+  console.log(dim('Analyzing staged changes…'));
+  let message = await generateMessage(env, staged);
+
+  while (true) {
+    previewBox(message);
+    const answer = (
+      await ask(
+        `\n${bold('Commit?')} ${green('[y]')} yes  ${yellow('[e]')} edit  ${cyan('[r]')} regenerate  ${red('[n]')} abort: `
+      )
+    ).toLowerCase();
+
+    if (answer === 'y' || answer === 'yes' || answer === '') {
+      commit(message);
+      return;
+    }
+    if (answer === 'e' || answer === 'edit') {
+      message = editMessage(message);
+      if (!message.trim()) {
+        die('Empty message, aborting.');
+      }
+      continue;
+    }
+    if (answer === 'r' || answer === 'regenerate') {
+      console.log(dim('Regenerating…'));
+      message = await generateMessage(env, staged);
+      continue;
+    }
+    if (answer === 'n' || answer === 'no' || answer === 'q') {
+      console.log(yellow('Aborted. Nothing committed.'));
+      return;
+    }
+    console.log(red('Unrecognized option.'));
+  }
+}
+
+main().catch((e) => die(e.stack || e.message));
