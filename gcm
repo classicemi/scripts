@@ -5,6 +5,9 @@
  * gcm — generate a Conventional-Commits message from staged changes using
  * the DeepSeek API, preview it, and commit on confirmation.
  *
+ * Usage: gcm [--simple|-s]
+ *   --simple, -s  Generate a single-line commit message (no body / bullet points).
+ *
  * Config: a `.env` file living next to this script with at least:
  *   DEEPSEEK_API_KEY=sk-...
  *   DEEPSEEK_MODEL=deepseek-v4-flash   # optional, this is the default
@@ -20,6 +23,10 @@ const SCRIPT_DIR = path.dirname(fs.realpathSync(process.argv[1]));
 const API_URL = 'https://api.deepseek.com/chat/completions';
 const DEFAULT_MODEL = 'deepseek-v4-flash';
 const DIFF_CHAR_CAP = 16000;
+
+// --- CLI flags ---
+const args = process.argv.slice(2);
+const SIMPLE_MODE = args.includes('--simple') || args.includes('-s');
 
 // --- tiny ANSI helpers (auto-disabled when not a TTY) ---
 const useColor = process.stdout.isTTY;
@@ -86,7 +93,18 @@ function getStaged() {
   return { nameStatus, diff, truncated };
 }
 
-const SYSTEM_PROMPT = `You are a senior engineer writing a git commit message.
+const SYSTEM_PROMPT = SIMPLE_MODE
+  ? `You are a senior engineer writing a git commit message.
+Follow the Conventional Commits specification strictly.
+
+Rules:
+- Format: <type>(<optional scope>): <subject>
+- type is one of: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert
+- Subject: imperative mood, lowercase first letter, no trailing period, <= 72 chars.
+- Write everything in ENGLISH.
+- Output a SINGLE LINE only — no body, no bullet points, no blank lines.
+- Output ONLY the raw commit message. No markdown fences, no preamble, no quotes.`
+  : `You are a senior engineer writing a git commit message.
 Follow the Conventional Commits specification strictly.
 
 Rules:
